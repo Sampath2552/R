@@ -1,0 +1,122 @@
+import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+# -------------------------------------------------------
+# 1. Create Spark session
+# -------------------------------------------------------
+spark = (
+    SparkSession.builder
+    .appName("DailyAverageBalanceCalc")
+    .config("spark.jars", "ojdbc8.jar")     # or ojdbc11.jar
+    .getOrCreate()
+)
+
+oracle_url = "jdbc:oracle:thin:@//HOST:PORT/SERVICE"
+oracle_user = "USERNAME"
+oracle_password = "PASSWORD"
+oracle_driver = "oracle.jdbc.driver.OracleDriver"
+
+# -------------------------------------------------------
+# 2. Get yesterday's date for filtering average table
+# -------------------------------------------------------
+yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%d-%m-%y")
+
+# -------------------------------------------------------
+# 3. Read yesterday’s average balance from Oracle (FILTERED QUERY)
+# -------------------------------------------------------
+avg_query = f"""
+    SELECT ACCOUNT_NO, BRANCH_CODE, BALANCE_DATE, AVG_BALANCE, DAYS_COUNT
+    FROM GL_AVERAGE
+    WHERE TRUNC(BALANCE_DATE) = TO_DATE('{yesterday}', 'DD-MM-YY')
+"""
+
+avg_df = (
+    spark.read.format("jdbc")
+    .option("url", oracle_url)
+    .option("query", avg_query)
+    .option("user", oracle_user)
+    .option("password", oracle_password)
+    .option("driver", oracle_driver)
+    .load()
+)
+
+print("Yesterday avg rows:", avg_df.count())
+avg_df.show()
+
+# -------------------------------------------------------
+# 4. Read today’s closing balance
+# -------------------------------------------------------
+closing_query = """
+    SELECT ACCOUNT_NO, BRANCH_CODE, CLOSING_BALANCE, BALANCE_DATE
+    FROM GL_CLOSING_BAL
+    WHERE TRUNC(BALANCE_DATE) = TRUNC(SYSDATE)
+"""
+
+closing_df = (
+    spark.read.format("jdbc")
+    .option("url", oracle_url)
+    .option("query", closing_query)
+    .option("user", oracle_user)
+    .option("password", oracle_password)
+    .option("driver", oracle_driver)
+    .load()
+)
+
+print("Today's closing rows:", closing_df.count())
+closing_df.show()
+
+# -------------------------------------------------------
+# 5. Join yesterday avg with today's closing
+# -------------------------------------------------------
+joined = (
+    closing_df.alias("c")
+    .join(
+        avg_df.alias("a"),
+        ["ACCOUNT_NO", "BRANCH_CODE"],
+        "left"
+    )
+)
+
+# -------------------------------------------------------
+# 6. Compute today's average
+# -------------------------------------------------------
+result = (
+    joined
+    .withColumn(
+        "NEW_DAYS_COUNT",
+        F.coalesce(F.col("a.DAYS_COUNT"), F.lit(0)) + 1
+    )
+    .withColumn(
+        "NEW_AVG_BALANCE",
+        (
+            F.coalesce(F.col("a.AVG_BALANCE") * F.col("a.DAYS_COUNT"), F.lit(0))
+            + F.col("c.CLOSING_BALANCE")
+        ) / F.col("NEW_DAYS_COUNT")
+    )
+    .select(
+        "ACCOUNT_NO",
+        "BRANCH_CODE",
+        F.col("c.BALANCE_DATE").alias("BALANCE_DATE"),
+        F.col("NEW_AVG_BALANCE").alias("AVG_BALANCE"),
+        F.col("NEW_DAYS_COUNT").alias("DAYS_COUNT")
+    )
+)
+
+result.show()
+
+# -------------------------------------------------------
+# 7. Append today's average back to Oracle
+# -------------------------------------------------------
+(
+    spark.write.format("jdbc")
+    .option("url", oracle_url)
+    .option("dbtable", "GL_AVERAGE")
+    .option("user", oracle_user)
+    .option("password", oracle_password)
+    .option("driver", oracle_driver)
+    .mode("append")
+    .save()
+)
+
+print("New average rows successfully written to Oracle!")o
