@@ -1,0 +1,23 @@
+const handleKeyEvent = (e) => {
+  let caps = false;
+
+  // 1) Browser detection
+  if (e.getModifierState) {
+    caps = e.getModifierState("CapsLock");
+  }
+
+  // 2) Additional heuristic for first key
+  if (e.key.length === 1) { 
+    const isLetter = e.key.toLowerCase() !== e.key.toUpperCase();
+
+    if (isLetter) {
+      const isUpper = e.key === e.key.toUpperCase();
+      const shiftPressed = e.shiftKey;
+
+      if (isUpper && !shiftPressed) caps = true;       // Caps on
+      if (!isUpper && shiftPressed) caps = true;       // Caps on
+    }
+  }
+
+  setCapsLockOn(caps);
+};
