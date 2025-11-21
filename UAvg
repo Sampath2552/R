@@ -1,0 +1,156 @@
+from pyspark.sql import SparkSession, functions as F, types as T
+
+
+def main():
+
+    # ======================================================
+    # 1. Spark Session
+    # ======================================================
+    spark = (
+        SparkSession.builder
+        .appName("GL-CBS-Reconciliation-Oracle")
+        .getOrCreate()
+    )
+
+    # Spark optimizations
+    spark.conf.set("spark.sql.adaptive.enabled", "true")
+    spark.conf.set("spark.sql.shuffle.partitions", "400")
+
+    # ======================================================
+    # 2. FIXED CONFIG (EDIT THESE)
+    # ======================================================
+
+    RECON_DATE = "2025-11-20"
+
+    ORACLE_HOST = "10.10.10.20"
+    ORACLE_PORT = "1521"
+    ORACLE_SERVICE = "FINDB"
+    ORACLE_USER = "FINCORE"
+    ORACLE_PASSWORD = "secret123"
+
+    GL_TABLE = "FINCORE.GL_BALANCE"
+    CBS_TABLE = "FINCORE.CBS_BALANCE"
+    TARGET_TABLE = "FINCORE.GL_CBS_BALANCE_RECON"
+
+    JDBC_BATCH_SIZE = 20000
+    ORACLE_PARALLEL_WRITERS = 20
+    REPARTITION_BY = 200
+
+    jdbc_url = f"jdbc:oracle:thin:@//{ORACLE_HOST}:{ORACLE_PORT}/{ORACLE_SERVICE}"
+
+    connection_properties = {
+        "user": ORACLE_USER,
+        "password": ORACLE_PASSWORD,
+        "driver": "oracle.jdbc.driver.OracleDriver",
+        "batchsize": str(JDBC_BATCH_SIZE)
+    }
+
+    # ======================================================
+    # 3. READ GL & CBS FROM ORACLE
+    # ======================================================
+
+    print("Reading GL from Oracle...")
+    df_gl = (
+        spark.read.format("jdbc")
+        .option("url", jdbc_url)
+        .option("dbtable", f"(SELECT * FROM {GL_TABLE} WHERE BALANCE_DATE = DATE '{RECON_DATE}')")
+        .option("user", ORACLE_USER)
+        .option("password", ORACLE_PASSWORD)
+        .option("driver", "oracle.jdbc.driver.OracleDriver")
+        .load()
+    )
+
+    print("Reading CBS from Oracle...")
+    df_cbs = (
+        spark.read.format("jdbc")
+        .option("url", jdbc_url)
+        .option("dbtable", f"(SELECT * FROM {CBS_TABLE} WHERE BALANCE_DATE = DATE '{RECON_DATE}')")
+        .option("user", ORACLE_USER)
+        .option("password", ORACLE_PASSWORD)
+        .option("driver", "oracle.jdbc.driver.OracleDriver")
+        .load()
+    )
+
+    print("GL Count:", df_gl.count())
+    print("CBS Count:", df_cbs.count())
+
+    # ======================================================
+    # 4. Repartition for performance
+    # ======================================================
+
+    glcc_cols = ["BRANCH_CODE", "CURRENCY", "CGL"]
+
+    df_gl = df_gl.repartition(REPARTITION_BY, *glcc_cols)
+    df_cbs = df_cbs.repartition(REPARTITION_BY, *glcc_cols)
+
+    # ======================================================
+    # 5. Format DataFrames fast UNION-ready
+    # ======================================================
+
+    df_gl2 = df_gl.select(
+        F.col("branch_code"),
+        F.col("currency"),
+        F.col("cgl"),
+        F.col("balance").cast(T.DecimalType(25, 4)).alias("gl_balance"),
+        F.lit(0).cast(T.DecimalType(25, 4)).alias("cbs_balance")
+    )
+
+    df_cbs2 = df_cbs.select(
+        F.col("branch_code"),
+        F.col("currency"),
+        F.col("cgl"),
+        F.lit(0).cast(T.DecimalType(25, 4)).alias("gl_balance"),
+        F.col("balance").cast(T.DecimalType(25, 4)).alias("cbs_balance")
+    )
+
+    # ======================================================
+    # 6. UNION ALL + GROUP BY (FASTEST)
+    # ======================================================
+
+    union_df = df_gl2.unionByName(df_cbs2)
+
+    df_recon = (
+        union_df
+        .groupBy("branch_code", "currency", "cgl")
+        .agg(
+            F.sum("gl_balance").alias("gl_balance"),
+            F.sum("cbs_balance").alias("cbs_balance")
+        )
+        .withColumn("difference", F.col("gl_balance") - F.col("cbs_balance"))
+        .withColumn("balance_date", F.lit(RECON_DATE))
+        .select(
+            "branch_code", "currency", "cgl",
+            "balance_date", "gl_balance", "cbs_balance", "difference"
+        )
+    )
+
+    df_recon.show(10, truncate=False)
+
+    # ======================================================
+    # 7. WRITE RECON TO ORACLE
+    # ======================================================
+
+    print(f"Writing reconciliation result to Oracle table: {TARGET_TABLE}")
+
+    df_recon = df_recon.repartition(ORACLE_PARALLEL_WRITERS, "branch_code")
+
+    (
+        df_recon.write.format("jdbc")
+        .option("url", jdbc_url)
+        .option("dbtable", TARGET_TABLE)
+        .option("user", ORACLE_USER)
+        .option("password", ORACLE_PASSWORD)
+        .option("driver", "oracle.jdbc.driver.OracleDriver")
+        .option("batchsize", JDBC_BATCH_SIZE)
+        .option("numPartitions", ORACLE_PARALLEL_WRITERS)
+        .mode("append")
+        .save()
+    )
+
+    print("=== DONE. Reconciliation successfully written to Oracle ===")
+
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main()
