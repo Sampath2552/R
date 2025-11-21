@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+gl_cbs_oracle_recon_full.py
+
+Full end-to-end PySpark reconciliation:
+ - Parallel JDBC reads from Oracle (GL & CBS) using ROW_NUMBER() as partitionColumn
+ - Generate GLCC inside SQL and read it
+ - UNION ALL + GROUP BY by GLCC to compute raw_difference
+ - Read yesterday's final_difference, join on GLCC (fullouter) and compute cumulative final_difference
+ - Write final results back to Oracle with parallel JDBC writers
+ - No CLI args; edit FIX CONFIG section below
+"""
+
+from pyspark.sql import SparkSession, functions as F, types as T
+import traceback
+import sys
+import math
+
+def print_header(msg):
+    print("\n" + "="*6 + " " + msg + " " + "="*6 + "\n")
+
+def read_count_for_date(spark, jdbc_url, user, password, driver, table, date_str):
+    """
+    Return count of rows for given date in Oracle table.
+    """
+    subq = f"(SELECT COUNT(1) AS CNT FROM {table} WHERE BALANCE_DATE = DATE '{date_str}') tmp"
+    df = (
+        spark.read.format("jdbc")
+            .option("url", jdbc_url)
+            .option("dbtable", subq)
+            .option("user", user)
+            .option("password", password)
+            .option("driver", driver)
+            .load()
+    )
+    cnt = df.collect()[0]["CNT"]
+    return int(cnt)
+
+def read_table_parallel_by_rownum(spark, jdbc_url, user, password, driver,
+                                 base_table, select_cols_sql, recon_date,
+                                 num_partitions, fetchsize):
+    """
+    Read data in parallel from Oracle using a subquery with ROW_NUMBER() (alias rn)
+    The caller passes SELECT columns portion (for example: "branch_code, currency, cgl, balance")
+    The returned DataFrame will include a numeric column 'rn' (1..N) allowing Spark to use partitionColumn='rn'
+    """
+    # Step 1: count rows for date -> used as upperBound
+    total = read_count_for_date(spark, jdbc_url, user, password, driver, base_table, recon_date)
+    if total == 0:
+        # return empty DF with expected schema by running limited query
+        subq = f"(SELECT {select_cols_sql}, 0 AS rn FROM {base_table} WHERE 1=0) tmp"
+        empty_df = (
+            spark.read.format("jdbc")
+                .option("url", jdbc_url)
+                .option("dbtable", subq)
+                .option("user", user)
+                .option("password", password)
+                .option("driver", driver)
+                .load()
+        )
+        return empty_df, total
+
+    # We'll use a subquery that computes ROW_NUMBER() OVER (ORDER BY <deterministic>) as rn
+    # ORDER BY should be deterministic and preferably use indexed column(s) to speed DB processing.
+    # We'll choose ORDER BY BRANCH_CODE, CURRENCY, CGL - if you have a numeric PK use that instead.
+    subquery = (
+        "(\n"
+        "  SELECT\n"
+        "    {cols},\n"
+        "    ROW_NUMBER() OVER (ORDER BY BRANCH_CODE, CURRENCY, CGL) rn\n"
+        "  FROM {table}\n"
+        "  WHERE BALANCE_DATE = DATE '{date}'\n"
+        ") tmp"
+    ).format(cols=select_cols_sql, table=base_table, date=recon_date)
+
+    # Partition on 'rn' from 1..total
+    df = (
+        spark.read.format("jdbc")
+            .option("url", jdbc_url)
+            .option("dbtable", subquery)
+            .option("user", user)
+            .option("password", password)
+            .option("driver", driver)
+            .option("partitionColumn", "RN")
+            .option("lowerBound", "1")
+            .option("upperBound", str(total))
+            .option("numPartitions", str(num_partitions))
+            .option("fetchsize", str(fetchsize))
+            .load()
+    )
+    return df, total
+
+def main():
+    try:
+        # ---------------------------------------------------------
+        # SPARK SETUP
+        # ---------------------------------------------------------
+        spark = (
+            SparkSession.builder
+                .appName("GL-CBS-Reconciliation-Full")
+                .getOrCreate()
+        )
+
+        # tuned spark confs (adjust to your cluster)
+        spark.conf.set("spark.sql.adaptive.enabled", "true")
+        spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        spark.conf.set("spark.sql.shuffle.partitions", "400")
+        spark.conf.set("spark.sql.files.maxPartitionBytes", "256MB")
+        spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
+        spark.conf.set("spark.driver.maxResultSize", "2g")
+
+        # ----------------------------------------------------------------
+        # FIX CONFIG - EDIT THESE VALUES FOR YOUR ENVIRONMENT
+        # ----------------------------------------------------------------
+        RECON_DATE = "2025-11-20"         # YYYY-MM-DD (the date you reconcile)
+        YESTERDAY_DATE = "2025-11-19"     # previous date for cumulative
+
+        # Oracle connection
+        ORACLE_HOST = "10.10.10.20"
+        ORACLE_PORT = "1521"
+        ORACLE_SERVICE = "FINDB"
+        ORACLE_USER = "FINCORE"
+        ORACLE_PASSWORD = "secret123"
+        ORACLE_DRIVER = "oracle.jdbc.driver.OracleDriver"
+        JDBC_URL = f"jdbc:oracle:thin:@//{ORACLE_HOST}:{ORACLE_PORT}/{ORACLE_SERVICE}"
+
+        # Tables
+        GL_TABLE = "FINCORE.GL_BALANCE"
+        CBS_TABLE = "FINCORE.CBS_BALANCE"
+        TARGET_TABLE = "FINCORE.GL_CBS_BALANCE_RECON"   # final table storing final_difference
+        PREV_TABLE = TARGET_TABLE  # we store final diffs in the same table (read by date)
+
+        # Performance tuning for JDBC reads
+        NUM_PARTITIONS_READ = 40    # number of parallel readers (tune)
+        FETCHSIZE = 20000           # oracle fetchsize
+        # Tuning for JDBC write
+        NUM_ORACLE_WRITERS = 20
+        JDBC_BATCHSIZE = 20000
+
+        # File reference (from your session) - included for logs / job metadata
+        # Developer note: this is the local path available in the session (we'll transform to URL when needed)
+        FILE_REF_URL_1 = "sandbox:/mnt/data/IMG_1654B63E-1B48-4FE8-9264-17D9434F1FC5.jpeg"
+        FILE_REF_URL_2 = "sandbox:/mnt/data/IMG_95B23773-CA2A-4B2D-B609-0A398FB77B25.jpeg"
+
+        # ----------------------------------------------------------------
+        # END FIX CONFIG
+        # ----------------------------------------------------------------
+
+        print_header("START RECONCILIATION")
+        print(f"Recon date: {RECON_DATE} (yesterday: {YESTERDAY_DATE})")
+        print("JDBC URL:", JDBC_URL)
+        print("File references (for job metadata):", FILE_REF_URL_1, FILE_REF_URL_2)
+
+        # ---------------------------------------------------------
+        # READ GL (parallel) - generate GLCC inside SQL, include rn for partitioning
+        # We select only necessary columns to minimize network I/O
+        # ---------------------------------------------------------
+        print_header("READ GL (PARALLEL)")
+        # construct select columns SQL for GL: include GLCC generation inside SQL
+        # we include the GLCC in the select and include rn (via the read helper)
+        select_cols_gl = "BRANCH_CODE, CURRENCY, CGL, BRANCH_CODE || '|' || CURRENCY || '|' || CGL AS GLCC, BALANCE"
+        df_gl, gl_total = read_table_parallel_by_rownum(
+            spark, JDBC_URL, ORACLE_USER, ORACLE_PASSWORD, ORACLE_DRIVER,
+            GL_TABLE, select_cols_gl, RECON_DATE, NUM_PARTITIONS_READ, FETCHSIZE
+        )
+        print(f"GL rows read (expected): {gl_total}")
+        if gl_total > 0:
+            df_gl = df_gl.select(
+                F.col("GLCC").alias("glcc"),
+                F.col("BALANCE").cast(T.DecimalType(25, 4)).alias("gl_balance")
+            )
+        else:
+            df_gl = spark.createDataFrame([], schema="glcc string, gl_balance decimal(25,4)")
+
+        # ---------------------------------------------------------
+        # READ CBS (parallel) - generate GLCC inside SQL
+        # ---------------------------------------------------------
+        print_header("READ CBS (PARALLEL)")
+        select_cols_cbs = "BRANCH_CODE, CURRENCY, CGL, BRANCH_CODE || '|' || CURRENCY || '|' || CGL AS GLCC, BALANCE"
+        df_cbs, cbs_total = read_table_parallel_by_rownum(
+            spark, JDBC_URL, ORACLE_USER, ORACLE_PASSWORD, ORACLE_DRIVER,
+            CBS_TABLE, select_cols_cbs, RECON_DATE, NUM_PARTITIONS_READ, FETCHSIZE
+        )
+        print(f"CBS rows read (expected): {cbs_total}")
+        if cbs_total > 0:
+            df_cbs = df_cbs.select(
+                F.col("GLCC").alias("glcc"),
+                F.col("BALANCE").cast(T.DecimalType(25, 4)).alias("cbs_balance")
+            )
+        else:
+            df_cbs = spark.createDataFrame([], schema="glcc string, cbs_balance decimal(25,4)")
+
+        # Quick sanity counts
+        print("GL DF partitions:", df_gl.rdd.getNumPartitions(), "CBS DF partitions:", df_cbs.rdd.getNumPartitions())
+
+        # ---------------------------------------------------------
+        # Compute raw_difference using UNION ALL + GROUP BY (fast)
+        # ---------------------------------------------------------
+        print_header("COMPUTE RAW DIFFERENCE (UNION ALL + GROUP BY)")
+        # Normalize schemas and union
+        df_gl2 = df_gl.select("glcc", "gl_balance").withColumn("cbs_balance", F.lit(0).cast(T.DecimalType(25,4)))
+        df_cbs2 = df_cbs.select("glcc", "cbs_balance").withColumn("gl_balance", F.lit(0).cast(T.DecimalType(25,4)))
+
+        union_df = df_gl2.unionByName(df_cbs2)
+
+        # Repartition by glcc to reduce post-aggregation shuffle (optional but useful)
+        union_df = union_df.repartition(max(200, NUM_PARTITIONS_READ), "glcc")
+
+        df_raw = (
+            union_df
+            .groupBy("glcc")
+            .agg(
+                F.sum("gl_balance").alias("gl_balance"),
+                F.sum("cbs_balance").alias("cbs_balance")
+            )
+            .withColumn("raw_difference", F.col("gl_balance") - F.col("cbs_balance"))
+            .select("glcc", "gl_balance", "cbs_balance", "raw_difference")
+        )
+
+        print("Raw difference count (distinct glcc):", df_raw.count())
+        df_raw.show(10, truncate=False)
+
+        # ---------------------------------------------------------
+        # Read yesterday final_difference from Oracle (prev) - small table, single read
+        # ---------------------------------------------------------
+        print_header("READ YESTERDAY FINAL DIFFERENCE")
+        prev_subq = f"(SELECT BRANCH_CODE, CURRENCY, CGL, FINAL_DIFFERENCE FROM {PREV_TABLE} WHERE BALANCE_DATE = DATE '{YESTERDAY_DATE}') tmp_prev"
+        df_prev = (
+            spark.read.format("jdbc")
+            .option("url", JDBC_URL)
+            .option("dbtable", prev_subq)
+            .option("user", ORACLE_USER)
+            .option("password", ORACLE_PASSWORD)
+            .option("driver", ORACLE_DRIVER)
+            .load()
+        )
+
+        if df_prev.rdd.isEmpty():
+            print("No previous day records found.")
+            df_prev = spark.createDataFrame([], schema="glcc string, prev_diff decimal(25,4)")
+        else:
+            df_prev = df_prev.withColumn("glcc", F.concat_ws("|", F.col("BRANCH_CODE"), F.col("CURRENCY"), F.col("CGL"))) \
+                             .select(F.col("glcc"), F.col("FINAL_DIFFERENCE").cast(T.DecimalType(25,4)).alias("prev_diff"))
+
+        print("Previous day distinct glcc count:", df_prev.count())
+        df_prev.show(10, truncate=False)
+
+        # ---------------------------------------------------------
+        # FULL OUTER JOIN raw (today) and prev (yesterday) on glcc
+        # ---------------------------------------------------------
+        print_header("JOIN TODAY RAW AND YESTERDAY FINAL (FULL OUTER JOIN)")
+        df_joined = df_raw.alias("t").join(df_prev.alias("p"), on="glcc", how="fullouter")
+
+        df_final = (
+            df_joined.select(
+                F.col("glcc"),
+                F.coalesce(F.col("t.raw_difference"), F.lit(0)).alias("raw_diff"),
+                F.coalesce(F.col("p.prev_diff"), F.lit(0)).alias("prev_diff")
+            )
+            .withColumn("final_difference", F.col("raw_diff") + F.col("prev_diff"))
+            .withColumn("balance_date", F.lit(RECON_DATE))
+            # split glcc back to columns for Oracle write
+            .withColumn("branch_code", F.split(F.col("glcc"), "\\|")[0]) 
+            .withColumn("currency", F.split(F.col("glcc"), "\\|")[1])
+            .withColumn("cgl", F.split(F.col("glcc"), "\\|")[2])
+            .select(
+                "branch_code", "currency", "cgl",
+                "balance_date", "gl_balance", "cbs_balance", "raw_diff", "prev_diff", "final_difference"
+            )
+        )
+
+        # Note: gl_balance, cbs_balance columns are not present in df_joined if some branches only exist in prev.
+        # To ensure columns exist, let's left-join gl_balance and cbs_balance from df_raw.
+        # (This ensures the written rows have these columns; missing values become 0)
+        df_raw_small = df_raw.select("glcc", "gl_balance", "cbs_balance")
+        df_final = (
+            df_final
+            .join(df_raw_small.withColumnRenamed("glcc", "_glcc"), F.concat_ws("|", F.col("branch_code"), F.col("currency"), F.col("cgl")) == F.col("_glcc"), how="left")
+            .drop("_glcc")
+        )
+
+        # Fill nulls for numeric columns
+        df_final = df_final.fillna({"gl_balance": 0.0, "cbs_balance": 0.0, "raw_diff": 0.0, "prev_diff": 0.0, "final_difference": 0.0})
+
+        print_header("FINAL SAMPLE")
+        print("Final schema and sample rows:")
+        df_final.printSchema()
+        df_final.show(20, truncate=False)
+
+        # ---------------------------------------------------------
+        # WRITE final results back to Oracle
+        # ---------------------------------------------------------
+        print_header("WRITE FINAL RESULTS TO ORACLE")
+
+        # Repartition to parallel writers based on branch_code (or glcc)
+        df_to_write = df_final.repartition(NUM_ORACLE_WRITERS, "branch_code")
+
+        write_props = {
+            "user": ORACLE_USER,
+            "password": ORACLE_PASSWORD,
+            "driver": ORACLE_DRIVER,
+            "batchsize": str(JDBC_BATCHSIZE),
+            # 'numPartitions' is a write hint used by some connectors; still set for safety
+            "numPartitions": str(NUM_ORACLE_WRITERS)
+        }
+
+        # Note: we use append mode. If you need "replace for the date", run a delete in Oracle for that date first.
+        # (Optional: implement delete-via-jdbc using a separate lightweight JDBC client if you want)
+        (
+            df_to_write.write
+                .mode("append")
+                .format("jdbc")
+                .option("url", JDBC_URL)
+                .option("dbtable", TARGET_TABLE)
+                .option("user", ORACLE_USER)
+                .option("password", ORACLE_PASSWORD)
+                .option("driver", ORACLE_DRIVER)
+                .option("batchsize", str(JDBC_BATCHSIZE))
+                .option("numPartitions", str(NUM_ORACLE_WRITERS))
+                .save()
+        )
+
+        print("Write completed. You may want to verify/update primary key / indexes on the target table.")
+
+        print_header("RECONCILIATION JOB COMPLETE")
+        spark.stop()
+
+    except Exception as e:
+        print("ERROR during reconciliation:")
+        traceback.print_exc()
+        try:
+            spark.stop()
+        except:
+            pass
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
