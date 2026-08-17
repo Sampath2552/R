@@ -1,0 +1,32 @@
+MERGE INTO gl_balance_prior_adjustment adjust
+USING (
+    
+    SELECT currency_code,
+      currency_rate,
+      rate_change_date
+FROM (
+   SELECT c.currency_code,
+          c.currency_rate,
+          c.rate_change_date,
+          ROW_NUMBER() OVER (
+              PARTITION BY c.currency_code
+              ORDER BY c.rate_change_date DESC
+          ) rn
+   FROM currency_rate_change c
+   WHERE c.rate_change_date >=
+         CASE
+             WHEN EXTRACT(DAY FROM TO_DATE(:input_date,'dd-mm-yyyy')) >= 30
+             THEN TRUNC(ADD_MONTHS(TO_DATE(:input_date,'dd-mm-yyyy'), 1), 'MM')
+             ELSE TRUNC(TO_DATE(:input_date,'dd-mm-yyyy'), 'MM')
+         END
+     AND c.rate_change_date <
+         CASE
+             WHEN EXTRACT(DAY FROM TO_DATE(:input_date,'dd-mm-yyyy')) >= 30
+             THEN TRUNC(ADD_MONTHS(TO_DATE(:input_date,'dd-mm-yyyy'), 1), 'MM') + 1
+             ELSE TO_DATE(:input_date,'dd-mm-yyyy')
+         END
+)
+WHERE rn = 1
+) rate on ( adjust.currency = rate.currency_code) when matched then update set adjust.ADJUSTMENT_AMOUNT_INR = adjust.adjustment_amount * rate.currency_rate;
+
+commit;
